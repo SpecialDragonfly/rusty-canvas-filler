@@ -1,15 +1,13 @@
-use uuid::Uuid;
+use std::{borrow::Borrow, str::FromStr};
+
 use warp::ws::{Message, WebSocket};
 use futures::{FutureExt, StreamExt};
-use crate::strategy::{Blackhole, Iterative, Strategy, StrategyType};
-use crate::{message, Client, Clients};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use message::StartCommand;
-use message::StopCommand;
-use message::InfoCommand;
 
-pub async fn client_connection(ws: WebSocket, clients: Clients) {
+use crate::message::{Command, Info, InfoResult, Start, Stop, StrategyType};
+
+pub async fn client_connection(ws: WebSocket) {
     println!("establishing client connection... {:?}", ws);
 
     let (client_ws_sender, mut client_ws_rcv) = ws.split();
@@ -23,94 +21,51 @@ pub async fn client_connection(ws: WebSocket, clients: Clients) {
         }
     }));
 
-    let uuid = Uuid::new_v4().simple().to_string();
-
-    let new_client = Client {
-        user_id: uuid.clone(),
-        sender: Some(client_sender),
-    };
-
-    clients.lock().await.insert(uuid.clone(), new_client);
-
     while let Some(result) = client_ws_rcv.next().await {
         let msg = match result {
             Ok(msg) => msg,
             Err(e) => {
-                println!("error receiving message for id {}): {}", uuid.clone(), e);
+                println!("error receiving message): {}", e);
                 break;
             }
         };
-        client_msg(&uuid, msg, &clients).await;
-    }
 
-    clients.lock().await.remove(&uuid);
-    println!("{} disconnected", uuid);
-}
+        println!("received message: {:?}", msg);
 
-async fn client_msg(client_id: &str, msg: Message, clients: &Clients) {
-    println!("received message from {}: {:?}", client_id, msg);
+        let message = match msg.to_str() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
 
-    let message = match msg.to_str() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    let parts = message.split("|").collect::<Vec<&str>>();
-
-    let start_command = StartCommand::new().command;
-    let stop_command = StopCommand::new().command;
-    let info_command = InfoCommand::new().command;
-
-    let locked = clients.lock().await;
-
-    let mut strategy: Option<StrategyType> = None;
-
-    match locked.get(client_id) {
-        Some(v) => {
-            if let Some(sender) = &v.sender {
-                match parts[0].to_string() {
-                    start_command => {
-                        let strategy_name = parts[1];
-                        let width = parts[2].parse().unwrap();
-                        let height = parts[3].parse().unwrap();
-                        match strategy_name {
-                            "iterative" => {
-                                let mut x = StrategyType::Iterative(Iterative::new(width, height));
-                                x.run(sender);
-                                strategy = Some(x);
-                            },
-                            "blackhole" => {
-                                let mut x = StrategyType::Blackhole(Blackhole::new(width, height));
-                                x.run(sender);
-                                strategy = Some(x);
-                            },
-                            _ => {
-                                return
-                            }
-                        }
-                    },
-                    stop_command => {
-                        match strategy {
-                            Some(mut strategy) => strategy.stop(),
-                            _ => return
-                        }
-                    },
-                    info_command => {
-                        match strategy {
-                            Some(strategy) => {
-                                let x = strategy.info();
-                                let _ = sender.send(
-                                    Ok(
-                                        Message::text(serde_json::to_string(&x).unwrap())
-                                    )
-                                );
-                            },
-                            _ => return
-                        }
-                    }
+        let mut used_strategy: Option<StrategyType> = None;
+        let command = Command::from_str(message).unwrap();
+        match command {
+            Command::Start{strategy} => {
+                let strategy_ref = used_strategy.insert(strategy);
+                strategy_ref.start(client_sender.borrow());
+            },
+            Command::Stop => {
+                if used_strategy.is_some() {
+                    let strategy_ref = used_strategy.unwrap();
+                    strategy_ref.stop();
+                }
+            },
+            Command::Info => {
+                if used_strategy.is_some() {
+                    let strategy_ref = used_strategy.unwrap();
+                    strategy_ref.info(client_sender.borrow());
+                } else {
+                    let _ = client_sender.send(
+                        Ok(
+                            Message::text(serde_json::to_string(
+                                &InfoResult{colours_used: 0, points_remaining: 0}
+                            ).unwrap())
+                        )
+                    );
                 }
             }
-        },
-        None => return,
+        }
     }
+
+    println!("disconnected");
 }
